@@ -1,3 +1,7 @@
+# TODO: Add SSH options to accept new hostkeys
+# TODO: Add posibility to checkout to sha1
+
+
 
 Set-StrictMode -Version 2.0
 # Set $ErrorActionPreference to what's set during Ansible execution
@@ -7,9 +11,9 @@ $ErrorActionPreference = "Stop"
 $complex_args = @{
     _ansible_check_mode = $false
     _ansible_diff = $false
-    repo = "ssh://git@bitbucket.artec-group.com:7999/clb/test-repo.git"
-    dest = "C:\test-repo"
-    version = "master"
+    repo = "ssh://git@bitbucket.artec-group.com:7999/clb/calibrator-scripts-and-binaries.git"
+    dest = "C:\calibrator-scripts-and-binaries"
+    version = "cc0dd3550379c3144ed5bb0a54ce520963d279a9"
     update = $true
     force = $true
     recursive = $true
@@ -205,10 +209,8 @@ function Get-GitUncommited {
         [String]
         $FolderPath = $dest
     )
-    Write-Host "here" $FolderPath
     $cmd_opts = @("status", "--porcelain")
     $ProcessResult  = $(Invoke-Process -FilePath git -ArgumentList $cmd_opts -WorkingDir $FolderPath)
-    Write-Host "here"
 
     if ( $ProcessResult.ExitCode -ne 0 ){
         $module.FailJson("Unable to get list of uncommited work: $($ProcessResult.StdErr)")
@@ -224,12 +226,18 @@ function Reset-GitRepository {
         [String]
         $FolderPath = $dest
     )
-    $cmd_opts = @("reset", "--hard", "HEAD")
-    $ProcessResult  = $(Invoke-Process -FilePath git -ArgumentList $cmd_opts -WorkingDir $FolderPath)
+    $ResetOpts = @("reset", "--hard", "HEAD")
+    $ProcessResult  = $(Invoke-Process -FilePath git -ArgumentList $ResetOpts -WorkingDir $FolderPath)
     if ( $ProcessResult.ExitCode -ne 0 ){
-        $module.FailJson("Unable to reset repository: $($ProcessResult.StdErr)")
+        $module.FailJson("Unable to reset repository at ${FolderPath}: $($ProcessResult.StdErr)")
     } else {
-        return $true
+        $CleanOpts = @("clean", "-fd")
+        $CleanResult = $(Invoke-Process -FilePath git -ArgumentList $CleanOpts -WorkingDir $FolderPath)
+        if ( $CleanResult.ExitCode -ne 0 ){
+            $module.FailJson("Unable to clean repository  at ${FolderPath}: $($ProcessResult.StdErr)")
+        } else {
+            return $true
+        }
     }
 }
 
@@ -272,7 +280,7 @@ function Update-Submodule {
     }
 }
 
-# =================================================
+# =================== Main code goes from here ===================
 
 if ( -Not $(Check-RemoteBranchExists)) {
     $module.FailJson("Unable to find branch $version in the $repo")
@@ -298,7 +306,7 @@ if ( -Not $(Test-Path -Path $dest) ) {
                 $module.Result.changed = $true
             }
         } else {
-            $module.Result.msg = "Skipping submodule update, because of uncommited changes (force = false)"
+            $module.Result.msg += "Skipping submodule update, because of uncommited changes (force = false)"
             $module.Result.before = Get-GitRepositoryVersion
             $module.Result.after = $module.Result.before
             $module.ExitJson()
@@ -335,18 +343,23 @@ if ( -Not $(Test-Path -Path $dest) ) {
         }
      
     } else {
-        $module.Result.msg = "Skipping repository update, because already at HEAD. "
+        $module.Result.msg += "Skipping repository update, because already at HEAD. "
     }
-    
+    $module.Result.msg += if ( $LocalVersion -ne $RemoteVersion ) { "Repository updated. " }
     $module.Result.before = $LocalVersion
     $module.Result.after = $RemoteVersion
 }
 
 
+# All this could be done with git submodule update -recursive, but i was aiming for several principals:
+# If something is not requiring update it shouldn't be touched
+# If we didn't have an access to submodule before but have now, we should update it
+# If we have some modified files (including untracked), we should clean it (if have flag force)
 if ($recursive -And $(Test-Path -Path "$dest\.gitmodules") -And ($update -Or $IsCloned)){
     $SubmodulePaths = Get-SubmodulePaths
     $SubmodulesToUpdate = @()
     $RequiresUpdate = $false
+
     foreach ($SubmodulePath in $SubmodulePaths) {
         if (Test-Path -Path "$dest\$SubmodulePath"){
             $SubmoduleCurrentCommit = $(Invoke-Process -FilePath git -ArgumentList @("rev-parse", "HEAD") -WorkingDir "$dest\$SubmodulePath").StdOut
@@ -355,14 +368,13 @@ if ($recursive -And $(Test-Path -Path "$dest\.gitmodules") -And ($update -Or $Is
 
             if ($(Get-GitUncommited -FolderPath "$dest\$SubmodulePath") -ne "") {
                 if ($force) {
-                    if($(Reset-GitRepository $SubmodulePath)){
+                    if($(Reset-GitRepository "$dest\$SubmodulePath")){
                         $module.Result.changed = $true
                     }
                 } else {
                     $module.Result.msg += "Skipping submodule update, because of uncommited changes (force = false)"
                     $module.ExitJson()
                 }
-        
             }
             
             if ( $SubmoduleCurrentCommit -ne $SubmoduleExpectedCommit) {
@@ -372,8 +384,9 @@ if ($recursive -And $(Test-Path -Path "$dest\.gitmodules") -And ($update -Or $Is
             $IsSubmoduleUpdated = Update-Submodule -Submodule "$SubmodulePath" 
         }
     
-        $module.Result.msg += " Submodules updated."
     }
+
+    $module.Result.msg += if ($IsSubmoduleUpdated) { "Submodules updated." }
 }
 
 if ( $module.Result.before -ne $module.Result.after -Or $IsCloned -Or $IsUrlChanged -Or $IsSubmoduleUpdated){
