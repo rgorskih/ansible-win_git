@@ -1,7 +1,4 @@
-# TODO: Add SSH options to accept new hostkeys
 # TODO: Add posibility to checkout to sha1
-
-
 
 Set-StrictMode -Version 2.0
 # Set $ErrorActionPreference to what's set during Ansible execution
@@ -13,10 +10,11 @@ $complex_args = @{
     _ansible_diff = $false
     repo = "ssh://git@bitbucket.artec-group.com:7999/clb/calibrator-scripts-and-binaries.git"
     dest = "C:\calibrator-scripts-and-binaries"
-    version = "cc0dd3550379c3144ed5bb0a54ce520963d279a9"
+    version = "master"
     update = $true
     force = $true
     recursive = $true
+    accept_newhostkey = $true
 }
 
 # Import any C# utils referenced with '#AnsibleRequires -CSharpUtil' or 'using Ansible.;
@@ -40,6 +38,8 @@ $spec = @{
         remote = @{ type = "str"; default = "origin"}
         update = @{ type = "bool"; default = $false }
         force = @{ type = "bool"; default = $false }
+        accept_hostkey  = @{ type = "bool"; default = $false }
+        accept_newhostkey  = @{ type = "bool"; default = $false }
     }
     supports_check_mode = $false
 }
@@ -53,11 +53,20 @@ $version = $module.Params.version
 $remote = $module.Params.remote
 $update = $module.Params.update
 $force = $module.Params.force
+$accept_hostkey = $module.Params.accept_hostkey
+$accept_newhostkey = $module.Params.accept_newhostkey
+
 
 $module.Result.changed = $false
 $module.Result.msg = ""
 $module.Result.before = $null
 $module.Result.after = $null
+
+$IsVersionCommit = if ( $version -match "^[0-9a-f]{40}$" ) { $true } else { $false }
+$IsCloned = $false
+$IsUrlChanged = $false
+$IsSubmoduleUpdated = $false
+
 
 function Invoke-Process {
     [CmdletBinding(SupportsShouldProcess)]
@@ -123,7 +132,7 @@ function Add-GitRemote {
 function Clone-GitRepository {
     $cmd_opts = @()
     $cmd_opts += "clone"
-    if ( $version -ne "master" ){
+    if ( $version -ne "master" -And -Not $IsVersionCommit ){
         $cmd_opts += "--branch"
         $cmd_opts += $version
     }
@@ -280,18 +289,54 @@ function Update-Submodule {
     }
 }
 
+function Set-SSHEnvironment {
+    $SSHEnv = $Env:GIT_SSH_COMMAND
+    $SSHOpts = ""
+    $SSHOpts += if ($accept_hostkey -And $SSHEnv -notlike "*StrictHostKeyChecking=no*" ) { "-o StrictHostKeyChecking=no " }   
+    $SSHOpts += if ($accept_newhostkey -And $SSHEnv -notlike "*StrictHostKeyChecking=accept-new*" ) { "-o StrictHostKeyChecking=accept-new " }
+    $SSHOpts += if ( $SSHEnv -notlike "*BatchMode=yes*" ) { "-o BatchMode=yes  " } 
+    $Env:GIT_SSH_COMMAND += if($null -eq  $SSHEnv){ "ssh $SSHOpts" } else { " $SSHOpts" }
+}
+
+
+function Switch-Git {
+    Fetch-GitRepository | Out-Null
+
+    if ( $IsVersionCommit -Or $(Check-GitBranches) ){
+        $git_checkout_opts =  @("checkout", "--force" ,"$version")
+        $git_reset_opts = @("reset", "--hard", "$version") 
+    } else {
+        $git_checkout_opts = @("checkout", "--track", "-b", "$version", "$remote/$version")
+        $git_reset_opts = @("reset", "--hard", "$remote/$version") 
+    }
+
+    $ProcessResult = $(Invoke-Process -FilePath git -ArgumentList $git_checkout_opts -WorkingDir $dest)
+
+    if ( $ProcessResult.ExitCode -ne 0 ){
+        $module.FailJson("Unable to checkout ${version}: $($ProcessResult.StdErr)")
+    }
+
+    $ProcessResult = Invoke-Process -FilePath git -ArgumentList $git_reset_opts -WorkingDir $dest
+    if ( $ProcessResult.ExitCode -ne 0 ){
+        $module.FailJson("Unable to reset $version to HEAD: $($ProcessResult.StdErr)")
+    }
+
+    return $true
+}
+
 # =================== Main code goes from here ===================
 
-if ( -Not $(Check-RemoteBranchExists)) {
+
+
+Set-SSHEnvironment
+
+if ( -Not $IsVersionCommit -And -Not $(Check-RemoteBranchExists)) {
     $module.FailJson("Unable to find branch $version in the $repo")
 }
 
-$IsCloned = $false
-$IsUrlChanged = $false
-$IsSubmoduleUpdated = $false
-
 if ( -Not $(Test-Path -Path $dest) ) {
-    $IsCloned = $(Clone-GitRepository)
+    $(Clone-GitRepository) | Out-Null
+    if ( $IsVersionCommit ) { Switch-Git }
     $module.Result.after = Get-GitRepositoryVersion
 } elseif ( -Not $(Test-Path -Path "$dest\.git\config") ) {
     $module.FailJson("Path $dest exists, but not a valid git repository")
@@ -323,31 +368,13 @@ if ( -Not $(Test-Path -Path $dest) ) {
     $RemoteVersion = $(Get-GitRepositoryVersionRemote)
     
     if ( $LocalVersion -ne $RemoteVersion) {
-        Fetch-GitRepository | Out-Null
-
-        if ($(Check-GitBranches) ){
-            $git_checkout_opts =  @("checkout", "--force" ,"$version")
-        } else {
-            $git_checkout_opts = @("checkout", "--track", "-b", "$version", "$remote/$version")
-        }
-
-        $ProcessResult = $(Invoke-Process -FilePath git -ArgumentList $git_checkout_opts -WorkingDir $dest)
-
-        if ( $ProcessResult.ExitCode -ne 0 ){
-            $module.FailJson("Unable to checkout branch ${version}: $($ProcessResult.StdErr)")
-        }
-
-        $ProcessResult = Invoke-Process -FilePath git -ArgumentList @("reset", "--hard", "$remote/$version") -WorkingDir $dest
-        if ( $ProcessResult.ExitCode -ne 0 ){
-            $module.FailJson("Unable to reset branch $version to HEAD: $($ProcessResult.StdErr)")
-        }
-     
+        $IsGitSwitched = Switch-Git
     } else {
         $module.Result.msg += "Skipping repository update, because already at HEAD. "
     }
-    $module.Result.msg += if ( $LocalVersion -ne $RemoteVersion ) { "Repository updated. " }
+    $module.Result.msg += if ( $IsGitSwitched ) { "Repository updated. " }
     $module.Result.before = $LocalVersion
-    $module.Result.after = $RemoteVersion
+    $module.Result.after = $(Get-GitRepositoryVersion)
 }
 
 
@@ -362,8 +389,8 @@ if ($recursive -And $(Test-Path -Path "$dest\.gitmodules") -And ($update -Or $Is
 
     foreach ($SubmodulePath in $SubmodulePaths) {
         if (Test-Path -Path "$dest\$SubmodulePath"){
-            $SubmoduleCurrentCommit = $(Invoke-Process -FilePath git -ArgumentList @("rev-parse", "HEAD") -WorkingDir "$dest\$SubmodulePath").StdOut
-            $SubmoduleExpectedCommitUnparsed = $(Invoke-Process -FilePath git -ArgumentList @("ls-tree", "HEAD", "$SubmodulePath") -WorkingDir "$dest").StdOut
+            $SubmoduleCurrentCommit = $(Invoke-Process -FilePath git -ArgumentList @("rev-parse", "HEAD") -WorkingDir "$dest\$SubmodulePath").StdOut.Replace("`n", "")
+            $SubmoduleExpectedCommitUnparsed = $(Invoke-Process -FilePath git -ArgumentList @("ls-tree", "HEAD", "$SubmodulePath") -WorkingDir "$dest").StdOut.Replace("`n", "")
             $SubmoduleExpectedCommit = if ( $SubmoduleExpectedCommitUnparsed -match "commit (\w+)") { $matches[1] }
 
             if ($(Get-GitUncommited -FolderPath "$dest\$SubmodulePath") -ne "") {
@@ -376,7 +403,6 @@ if ($recursive -And $(Test-Path -Path "$dest\.gitmodules") -And ($update -Or $Is
                     $module.ExitJson()
                 }
             }
-            
             if ( $SubmoduleCurrentCommit -ne $SubmoduleExpectedCommit) {
                 $IsSubmoduleUpdated = Update-Submodule -Submodule "$SubmodulePath"           
             }
